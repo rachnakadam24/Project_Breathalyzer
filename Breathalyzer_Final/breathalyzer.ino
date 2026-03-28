@@ -3,6 +3,7 @@
 //  Board  : Arduino Uno R3
 //  MQ3    : A0  (alcohol vapour)
 //  MQ135  : A1  (air quality / breath confirmation)
+//  FAN    : D6  (PWM via BJT — active during breath test + purge)
 //
 //  CYCLE:
 //    1. Warm-up      : 30s  (sensor stabilisation)
@@ -12,56 +13,46 @@
 //    5. Repeat from step 2
 // ============================================================
 
-#define MQ3_PIN   A0
-#define MQ135_PIN A1
+#define MQ3_PIN    A0
+#define MQ135_PIN  A1
+#define FAN_PIN    6      // PWM pin → BJT base → 5V fan
+
+// ── Fan speed (0–255 PWM) ────────────────────────────────────
+//  255 = full speed, lower if fan is too strong
+const int FAN_SPEED = 200;
 
 // ── Sensitivity: % rise above baseline to count as a real change ──
-//
-//  MQ3_RISE_PCT   — how many % above the MQ3 clean-air average
-//                   counts as "alcohol vapour detected"
-//                   e.g. 10.0 means the reading must be >10% higher
-//                   than the baseline average
-//
-//  MQ135_RISE_PCT — same idea for MQ135 ("real breath" confirmation)
-//
-//  These are the ONLY two values you may want to tweak.
-//  Raise them if you get too many false positives.
-//  Lower them if the sensor misses real events.
-//
-const float MQ3_RISE_PCT   = 10.0;   // % above MQ3   baseline avg
-const float MQ135_RISE_PCT = 5.0;    // % above MQ135 baseline avg
+const float MQ3_RISE_PCT   = 10.0;
+const float MQ135_RISE_PCT = 5.0;
 
 // ── Sampling ────────────────────────────────────────────────
-const int   BASELINE_DURATION_S  = 30;
-const int   BREATH_DURATION_S    = 20;
-const int   WARMUP_DURATION_S    = 30;
-const int   PURGE_DURATION_S     = 30;
-const int   SAMPLE_HZ            = 10;
-const int   SAMPLE_INTERVAL_MS   = 1000 / SAMPLE_HZ;  // 100 ms
+const int BASELINE_DURATION_S  = 30;
+const int BREATH_DURATION_S    = 20;
+const int WARMUP_DURATION_S    = 30;
+const int PURGE_DURATION_S     = 30;
+const int SAMPLE_HZ            = 10;
+const int SAMPLE_INTERVAL_MS   = 1000 / SAMPLE_HZ;
 
 // ── Rolling average window ───────────────────────────────────
-//  How many samples to average together at each moment.
-//  At 10 Hz, window=5 means each rolling average covers 0.5 seconds.
-//  Increase to smooth more. Decrease to react faster.
 const int ROLLING_WINDOW = 5;
 
-// Circular buffers that hold the last ROLLING_WINDOW readings
 float rollingMQ3[ROLLING_WINDOW];
 float rollingMQ135[ROLLING_WINDOW];
-int   rollingIndex = 0;   // points to the oldest slot (next to overwrite)
+int   rollingIndex = 0;
 
-// ── Baseline struct returned by doBaseline() ─────────────────
 struct Baseline {
-  float avgMQ3;    // average ADC over the baseline window
+  float avgMQ3;
   float avgMQ135;
-  float threshMQ3;    // avgMQ3   * (1 + MQ3_RISE_PCT/100)
-  float threshMQ135;  // avgMQ135 * (1 + MQ135_RISE_PCT/100)
+  float threshMQ3;
+  float threshMQ135;
 };
 
 // ============================================================
 void setup() {
   Serial.begin(9600);
-  initRollingBuffers(0.0);   // zero-fill buffers before first use
+  pinMode(FAN_PIN, OUTPUT);
+  analogWrite(FAN_PIN, 0);        // fan off at startup
+  initRollingBuffers(0.0);
   printHeader("NON-CONTACT BREATHALYZER");
   doWarmup();
 }
@@ -96,10 +87,7 @@ void doWarmup() {
 }
 
 // ============================================================
-//  PHASE 2 — BASELINE SAMPLING  (10 Hz for 30 s)
-//  Returns a Baseline struct containing the averages and the
-//  auto-calculated thresholds derived from them.
-//  No manual threshold constants needed.
+//  PHASE 2 — BASELINE SAMPLING
 // ============================================================
 Baseline doBaseline() {
   printHeader("PHASE: BASELINE");
@@ -118,7 +106,6 @@ Baseline doBaseline() {
     sumMQ3   += rawMQ3;
     sumMQ135 += rawMQ135;
 
-    // Print once per second (every SAMPLE_HZ samples)
     if (s % SAMPLE_HZ == 0) {
       printSensorLine("BASELINE", lastSecond,
                       rawMQ3,   adcToVoltage(rawMQ3),
@@ -129,14 +116,9 @@ Baseline doBaseline() {
     delay(SAMPLE_INTERVAL_MS);
   }
 
-  // ── Build and return the Baseline struct ──────────────────
   Baseline bl;
   bl.avgMQ3   = (float)sumMQ3   / totalSamples;
   bl.avgMQ135 = (float)sumMQ135 / totalSamples;
-
-  // Threshold = average + X% of average
-  //   e.g. avg=400, MQ3_RISE_PCT=10  →  threshold = 400 * 1.10 = 440
-  // Any reading above this during the breath phase counts as a "rise"
   bl.threshMQ3   = bl.avgMQ3   * (1.0 + MQ3_RISE_PCT   / 100.0);
   bl.threshMQ135 = bl.avgMQ135 * (1.0 + MQ135_RISE_PCT / 100.0);
 
@@ -154,21 +136,13 @@ Baseline doBaseline() {
 }
 
 // ============================================================
-//  PHASE 3 — BREATH TEST  (20 s)
-//
-//  Rolling average logic:
-//    Every new sample, we drop the oldest reading from the
-//    window and add the newest (circular buffer).
-//    We compute the rolling average at each step, then track
-//    the PEAK of that rolling average over the full 20s window.
-//
-//    This means:
-//      • A single noisy ADC spike gets diluted by (ROLLING_WINDOW-1)
-//        clean readings → cannot trigger a false positive alone
-//      • A real breath sustained for >0.5s pushes the rolling
-//        average above threshold reliably → detected correctly
+//  PHASE 3 — BREATH TEST
 // ============================================================
 void doBreathTest(Baseline bl) {
+  // ── FAN ON ───────────────────────────────────────────────
+  analogWrite(FAN_PIN, FAN_SPEED);
+  Serial.println(F("Fan ON."));
+
   printHeader("PHASE: BREATH TEST");
   Serial.println(F("Please breathe toward the sensors now."));
   Serial.print(F("  (MQ3 must exceed ADC="));  Serial.print(bl.threshMQ3,   1);
@@ -177,11 +151,9 @@ void doBreathTest(Baseline bl) {
   Serial.println(F(" samples)"));
   Serial.println(F(""));
 
-  // Pre-fill rolling buffers with the baseline averages so the
-  // average starts at a neutral value, not at zero
   initRollingBuffers(bl.avgMQ3, bl.avgMQ135);
 
-  float peakRollingMQ3   = 0.0;   // highest rolling-avg seen in the window
+  float peakRollingMQ3   = 0.0;
   float peakRollingMQ135 = 0.0;
   int   totalSamples     = BREATH_DURATION_S * SAMPLE_HZ;
   int   lastSecond       = BREATH_DURATION_S;
@@ -190,15 +162,10 @@ void doBreathTest(Baseline bl) {
     int rawMQ3   = analogRead(MQ3_PIN);
     int rawMQ135 = analogRead(MQ135_PIN);
 
-    // ── Update circular buffers ───────────────────────────
-    //  rollingIndex always points to the slot about to be overwritten
-    //  (i.e. the oldest value). We replace it with the newest reading,
-    //  then advance the index.
     rollingMQ3[rollingIndex]   = rawMQ3;
     rollingMQ135[rollingIndex] = rawMQ135;
     rollingIndex = (rollingIndex + 1) % ROLLING_WINDOW;
 
-    // ── Compute rolling averages ──────────────────────────
     float sumMQ3 = 0, sumMQ135 = 0;
     for (int i = 0; i < ROLLING_WINDOW; i++) {
       sumMQ3   += rollingMQ3[i];
@@ -207,18 +174,15 @@ void doBreathTest(Baseline bl) {
     float ravgMQ3   = sumMQ3   / ROLLING_WINDOW;
     float ravgMQ135 = sumMQ135 / ROLLING_WINDOW;
 
-    // ── Track peak of rolling average ────────────────────
     if (ravgMQ3   > peakRollingMQ3)   peakRollingMQ3   = ravgMQ3;
     if (ravgMQ135 > peakRollingMQ135) peakRollingMQ135 = ravgMQ135;
 
-    // ── Print once per second ─────────────────────────────
     if (s % SAMPLE_HZ == 0) {
       float vMQ3     = adcToVoltage(rawMQ3);
       float vMQ135   = adcToVoltage(rawMQ135);
       float deltaMQ3   = ravgMQ3   - bl.avgMQ3;
       float deltaMQ135 = ravgMQ135 - bl.avgMQ135;
 
-      // Print raw readings + the smoothed rolling-average delta
       printSensorLineWithDelta("BREATH", lastSecond,
                                rawMQ3,   vMQ3,   deltaMQ3,
                                rawMQ135, vMQ135, deltaMQ135);
@@ -228,7 +192,10 @@ void doBreathTest(Baseline bl) {
     delay(SAMPLE_INTERVAL_MS);
   }
 
-  // ── Compare PEAK of rolling average to thresholds ────────
+  // ── FAN OFF ──────────────────────────────────────────────
+  analogWrite(FAN_PIN, 0);
+  Serial.println(F("Fan OFF."));
+
   bool mq3Rose   = peakRollingMQ3   >= bl.threshMQ3;
   bool mq135Rose = peakRollingMQ135 >= bl.threshMQ135;
 
@@ -243,7 +210,6 @@ void doBreathTest(Baseline bl) {
   Serial.println(mq135Rose ? F("  [ROSE]") : F("  [flat]"));
   Serial.println(F(""));
 
-  // ── Verdict ──────────────────────────────────────────────
   if (mq3Rose && !mq135Rose) {
     printVerdict("PERFUME / AMBIENT VAPOUR",
                  "MQ3 rose but MQ135 stayed flat — no breath detected.",
@@ -267,9 +233,13 @@ void doBreathTest(Baseline bl) {
 }
 
 // ============================================================
-//  PHASE 4 — PURGE  (30 s, sensor recovery)
+//  PHASE 4 — PURGE
 // ============================================================
 void doPurge() {
+  // ── FAN ON ───────────────────────────────────────────────
+  analogWrite(FAN_PIN, FAN_SPEED);
+  Serial.println(F("Fan ON."));
+
   printHeader("PHASE: PURGE (sensor recovery)");
   Serial.println(F("Sensors clearing. Please step away."));
   Serial.println(F(""));
@@ -284,6 +254,10 @@ void doPurge() {
     delay(1000);
   }
 
+  // ── FAN OFF ──────────────────────────────────────────────
+  analogWrite(FAN_PIN, 0);
+  Serial.println(F("Fan OFF."));
+
   Serial.println(F(""));
   Serial.println(F("Purge complete! Starting new cycle..."));
 }
@@ -291,8 +265,6 @@ void doPurge() {
 // ============================================================
 //  ROLLING BUFFER HELPERS
 // ============================================================
-
-// Fill both buffers with a single value (used on startup to zero-fill)
 void initRollingBuffers(float val) {
   for (int i = 0; i < ROLLING_WINDOW; i++) {
     rollingMQ3[i]   = val;
@@ -301,8 +273,6 @@ void initRollingBuffers(float val) {
   rollingIndex = 0;
 }
 
-// Fill buffers with separate baseline values (used before breath test
-// so the rolling average starts at baseline, not zero)
 void initRollingBuffers(float valMQ3, float valMQ135) {
   for (int i = 0; i < ROLLING_WINDOW; i++) {
     rollingMQ3[i]   = valMQ3;
@@ -314,13 +284,10 @@ void initRollingBuffers(float valMQ3, float valMQ135) {
 // ============================================================
 //  HELPERS
 // ============================================================
-
-// Convert 10-bit ADC value to voltage (5V reference, 1023 max)
 float adcToVoltage(float adc) {
   return adc * (5.0 / 1023.0);
 }
 
-// Print one sensor line (no delta) — used in warm-up, purge, baseline
 void printSensorLine(const char* phase, int timeLeft,
                      int rawMQ3, float vMQ3,
                      int rawMQ135, float vMQ135) {
@@ -330,19 +297,16 @@ void printSensorLine(const char* phase, int timeLeft,
   if (timeLeft < 10) Serial.print(F("0"));
   Serial.print(timeLeft);
   Serial.print(F("s"));
-
   Serial.print(F("  |  MQ3:  ADC="));
   Serial.print(rawMQ3);
   Serial.print(F("  V="));
   Serial.print(vMQ3, 3);
-
   Serial.print(F("  |  MQ135: ADC="));
   Serial.print(rawMQ135);
   Serial.print(F("  V="));
   Serial.println(vMQ135, 3);
 }
 
-// Print one sensor line WITH deltas — used during breath test
 void printSensorLineWithDelta(const char* phase, int timeLeft,
                               int rawMQ3,   float vMQ3,   float dMQ3,
                               int rawMQ135, float vMQ135, float dMQ135) {
@@ -352,14 +316,12 @@ void printSensorLineWithDelta(const char* phase, int timeLeft,
   if (timeLeft < 10) Serial.print(F("0"));
   Serial.print(timeLeft);
   Serial.print(F("s"));
-
   Serial.print(F("  |  MQ3:  ADC="));
   Serial.print(rawMQ3);
   Serial.print(F("  V="));
   Serial.print(vMQ3, 3);
   Serial.print(F("  dADC="));
   Serial.print(dMQ3, 1);
-
   Serial.print(F("  |  MQ135: ADC="));
   Serial.print(rawMQ135);
   Serial.print(F("  V="));
